@@ -281,7 +281,7 @@ def query_body(vector: SparseJson, config: Config) -> dict[str, Any]:
     }
     if config.query_cut is None:
         return body
-    cut_params = {"keep_query_dims": config.query_cut}
+    cut_params = {"query_dims": config.query_cut}
     if config.oversampling is None:
         body["params"] = cut_params
         return body
@@ -311,15 +311,15 @@ async def search(
 async def assert_query_cut_supported(
     client: httpx.AsyncClient, name: str, vector: SparseJson
 ) -> None:
-    """A server that knows `keep_query_dims` rejects 0. An older one ignores the field."""
+    """A server that knows `query_dims` rejects 0. An older one ignores the field."""
     response = await client.post(
         f"/collections/{name}/points/query",
         json=query_body(vector, Config(query_cut=0, oversampling=None)),
     )
     if response.status_code not in (400, 422):
         raise SystemExit(
-            f"Server accepted keep_query_dims=0 (HTTP {response.status_code}): "
-            "it was not built with keep_query_dims, results would be meaningless."
+            f"Server accepted query_dims=0 (HTTP {response.status_code}): "
+            "it was not built with query_dims, results would be meaningless."
         )
 
 
