@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import math
 import random
+import sys
 import tarfile
 import time
 from collections.abc import Iterator
@@ -28,7 +29,6 @@ from scipy import sparse
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "storage"
 DOCS_ARCHIVE = "documents.tar.gz"
-QUERIES_ARCHIVE = "queries.tar.gz"
 VECTOR_NAME = "splade"
 VOCAB_SIZE = 30_522  # BERT wordpiece vocabulary: the number of possible dimensions
 TOP = 10
@@ -37,6 +37,12 @@ CSR_CHUNK_DOCS = 50_000  # documents converted to a numpy matrix at once
 GROUND_TRUTH_CHUNK = 25  # queries scored against the whole corpus at once
 UPLOAD_CONCURRENCY = 4
 
+
+def progress(*args: object, **kwargs: Any) -> None:
+    """Progress goes to stderr, so stdout holds only the report and can be redirected."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
 SparseJson = dict[str, list[Any]]
 
 
@@ -44,7 +50,8 @@ SparseJson = dict[str, list[Any]]
 class Corpus:
     doc_ids: list[str]
     docs: sparse.csr_matrix
-    queries: sparse.csr_matrix
+    query_rows: np.ndarray  # rows of `docs` that are used as queries
+    queries: sparse.csr_matrix  # those rows, in the same order
 
 
 class Hits(NamedTuple):
@@ -72,9 +79,9 @@ class RunResult:
     label: str
     client_ms: np.ndarray
     server_ms: np.ndarray
-    recall: float
-    mrr: float
-    ndcg: float
+    recall: np.ndarray  # one value per query, as for mrr and ndcg
+    mrr: np.ndarray
+    ndcg: np.ndarray
 
 
 class RawVector(NamedTuple):
@@ -90,7 +97,7 @@ def stream_vectors(archive: Path, member_suffix: str) -> Iterator[RawVector]:
         for member in tar:
             if not member.name.endswith(member_suffix):
                 continue
-            print(f"Reading {member.name}")
+            progress(f"Reading {member.name}")
             file = tar.extractfile(member)
             assert file is not None
             # ijson parses `{"vectors": [...]}` lazily, one array item at a time
@@ -130,7 +137,7 @@ def load_matrix(
         if pending:
             chunks.append(to_csr(pending))
             pending.clear()
-            print(f"\r  {len(ids)} vectors", end="", flush=True)
+            progress(f"\r  {len(ids)} vectors", end="", flush=True)
 
     for vector in stream_vectors(archive, member_suffix):
         ids.append(vector.doc_id)
@@ -140,7 +147,7 @@ def load_matrix(
         if len(ids) == limit:
             break
     flush()
-    print()
+    progress()
     # vstack glues the chunks on top of each other into one matrix
     matrix = sparse.vstack(chunks, format="csr")
     matrix.eliminate_zeros()  # drop explicit zero weights, if any
@@ -148,29 +155,45 @@ def load_matrix(
     return ids, matrix
 
 
-def load_corpus(data_dir: Path, max_docs: int, num_queries: int) -> Corpus:
+def load_corpus(data_dir: Path, max_docs: int, num_queries: int, seed: int) -> Corpus:
     doc_ids, docs = load_matrix(data_dir / DOCS_ARCHIVE, ".json", max_docs)
-    _, queries = load_matrix(data_dir / QUERIES_ARCHIVE, ".json", num_queries)
-    return Corpus(doc_ids=doc_ids, docs=docs, queries=queries)
+    query_rows, queries = sample_queries(docs, num_queries, seed)
+    return Corpus(doc_ids=doc_ids, docs=docs, query_rows=query_rows, queries=queries)
 
 
-def top_k_per_row(scores: np.ndarray) -> np.ndarray:
+def sample_queries(
+    docs: sparse.csr_matrix, num_queries: int, seed: int
+) -> tuple[np.ndarray, sparse.csr_matrix]:
+    """Pick `num_queries` different docs at random. The same seed gives the same docs."""
+    assert num_queries <= docs.shape[0], (
+        f"Cannot sample {num_queries} queries from {docs.shape[0]} docs"
+    )
+    rng = np.random.default_rng(seed)
+    rows = rng.choice(docs.shape[0], size=num_queries, replace=False)
+    return rows, docs[rows]
+
+
+def top_k_per_row(scores: np.ndarray, k: int) -> np.ndarray:
     """For each row of a (queries x docs) score matrix, return the column ids of
-    the TOP highest scores, best first."""
-    # argpartition is a cheap partial sort: the first TOP entries of its result
-    # are the TOP largest scores, in no particular order. Scores are negated
+    the k highest scores, best first."""
+    # argpartition is a cheap partial sort: the first k entries of its result
+    # are the k largest scores, in no particular order. Scores are negated
     # because argpartition puts the smallest values first.
-    candidates = np.argpartition(-scores, TOP, axis=1)[:, :TOP]
+    candidates = np.argpartition(-scores, k, axis=1)[:, :k]
     # take_along_axis picks, in every row, the scores at that row's candidates
     candidate_scores = np.take_along_axis(scores, candidates, axis=1)
-    # argsort fully sorts only these TOP candidates per row (negated: best first)
+    # argsort fully sorts only these k candidates per row (negated: best first)
     order = np.argsort(-candidate_scores, axis=1)
     # reorder the candidate doc ids with that ranking
     return np.take_along_axis(candidates, order, axis=1)
 
 
 def ground_truth(corpus: Corpus) -> list[list[str]]:
-    """Exact top TOP doc ids per query, by brute-force dot product."""
+    """Exact top TOP doc ids per query, by brute-force dot product.
+
+    Every query is a corpus doc, which would always find itself first.
+    It is left out of its own ground truth.
+    """
     # .T flips the (docs x dims) matrix to (dims x docs). tocsr() makes the flip
     # physical, so the products below read contiguous memory.
     docs_t = corpus.docs.T.tocsr()
@@ -182,10 +205,15 @@ def ground_truth(corpus: Corpus) -> list[list[str]]:
         # every query's dot product with every doc. toarray() makes it a dense
         # numpy array, which is small enough with only a few queries at a time.
         scores = (chunk @ docs_t).toarray()
-        top = top_k_per_row(scores)
-        expected.extend([corpus.doc_ids[doc] for doc in row] for row in top)
-        print(f"\r  {len(expected)}/{corpus.queries.shape[0]}", end="", flush=True)
-    print()
+        # one extra candidate, so TOP are left once the query doc itself is gone
+        top = top_k_per_row(scores, TOP + 1)
+        own_rows = corpus.query_rows[start : start + GROUND_TRUTH_CHUNK]
+        for own_row, row in zip(own_rows, top, strict=True):
+            own_id = corpus.doc_ids[own_row]
+            ids = [corpus.doc_ids[doc] for doc in row]
+            expected.append([doc for doc in ids if doc != own_id][:TOP])
+        progress(f"\r  {len(expected)}/{corpus.queries.shape[0]}", end="", flush=True)
+    progress()
     return expected
 
 
@@ -241,10 +269,10 @@ async def upload(
             )
             response.raise_for_status()
             done += end - start
-            print(f"\rUploaded {done}/{total}", end="", flush=True)
+            progress(f"\rUploaded {done}/{total}", end="", flush=True)
 
     await asyncio.gather(*(send(start) for start in range(0, total, batch_size)))
-    print()
+    progress()
 
 
 async def collection_info(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
@@ -265,12 +293,12 @@ def query_body(vector: SparseJson, config: Config) -> dict[str, Any]:
     body: dict[str, Any] = {
         "query": vector,
         "using": VECTOR_NAME,
-        "limit": TOP,
+        "limit": TOP + 1,  # one spare: the query doc finds itself
         "with_payload": ["_id"],
     }
     if config.query_cut is None:
         return body
-    cut_params = {"query_dims": config.query_cut}
+    cut_params = {"max_sparse_dims": config.query_cut}
     if config.oversampling is None:
         body["params"] = cut_params
         return body
@@ -279,14 +307,18 @@ def query_body(vector: SparseJson, config: Config) -> dict[str, Any]:
     body["prefetch"] = {
         "query": vector,
         "using": VECTOR_NAME,
-        "limit": TOP * config.oversampling,
+        "limit": (TOP + 1) * config.oversampling,
         "params": cut_params,
     }
     return body
 
 
 async def search(
-    client: httpx.AsyncClient, name: str, vector: SparseJson, config: Config
+    client: httpx.AsyncClient,
+    name: str,
+    vector: SparseJson,
+    config: Config,
+    own_id: str,
 ) -> Hits:
     response = await client.post(
         f"/collections/{name}/points/query", json=query_body(vector, config)
@@ -294,21 +326,23 @@ async def search(
     response.raise_for_status()
     body = response.json()
     ids = [point["payload"]["_id"] for point in body["result"]["points"]]
+    # the query is a corpus doc: drop it from its own results
+    ids = [doc for doc in ids if doc != own_id][:TOP]
     return Hits(ids, body["time"] * 1000)
 
 
 async def assert_query_cut_supported(
     client: httpx.AsyncClient, name: str, vector: SparseJson
 ) -> None:
-    """A server that knows `query_dims` rejects 0. An older one ignores the field."""
+    """A server that knows `max_sparse_dims` rejects 0. An older one ignores the field."""
     response = await client.post(
         f"/collections/{name}/points/query",
         json=query_body(vector, Config(query_cut=0, oversampling=None)),
     )
     if response.status_code not in (400, 422):
         raise SystemExit(
-            f"Server accepted query_dims=0 (HTTP {response.status_code}): "
-            "it was not built with query_dims, results would be meaningless."
+            f"Server accepted max_sparse_dims=0 (HTTP {response.status_code}): "
+            "it was not built with max_sparse_dims, results would be meaningless."
         )
 
 
@@ -316,6 +350,7 @@ async def run_interleaved(
     client: httpx.AsyncClient,
     name: str,
     vectors: list[SparseJson],
+    own_ids: list[str],
     expected: list[list[str]],
     configs: list[Config],
     warmup: int,
@@ -325,32 +360,34 @@ async def run_interleaved(
     Slow drift on the machine (heat, background load) then hits all configs alike.
     """
     rng = random.Random(INTERLEAVE_SEED)
-    print(f"Running {len(configs)} configs, interleaved")
+    progress(f"Running {len(configs)} configs, interleaved")
 
     def shuffled() -> list[int]:
         return rng.sample(range(len(configs)), len(configs))
 
-    for vector in vectors[:warmup]:
+    for vector, own_id in zip(vectors[:warmup], own_ids, strict=False):
         for index in shuffled():
-            await search(client, name, vector, configs[index])
+            await search(client, name, vector, configs[index], own_id)
 
     client_ms: list[list[float]] = [[] for _ in configs]
     server_ms: list[list[float]] = [[] for _ in configs]
     scores: list[list[tuple[float, float, float]]] = [[] for _ in configs]
-    for number, (vector, truth) in enumerate(zip(vectors, expected, strict=True)):
+    for number, (vector, own_id, truth) in enumerate(
+        zip(vectors, own_ids, expected, strict=True)
+    ):
         for index in shuffled():
             start = time.perf_counter()
-            hits = await search(client, name, vector, configs[index])
+            hits = await search(client, name, vector, configs[index], own_id)
             client_ms[index].append((time.perf_counter() - start) * 1000)
             server_ms[index].append(hits.server_ms)
             scores[index].append(score_query(hits.ids, truth))
         if (number + 1) % 100 == 0:
-            print(f"  {number + 1}/{len(vectors)} queries")
+            progress(f"  {number + 1}/{len(vectors)} queries")
 
     results = []
     for index, config in enumerate(configs):
-        # scores is (queries x 3): axis=0 averages down the rows, one mean per metric
-        recall, mrr, ndcg = np.mean(scores[index], axis=0)
+        # scores is (queries x 3): one column per metric, one value per query
+        recall, mrr, ndcg = np.array(scores[index]).T
         results.append(
             RunResult(
                 config.label,
@@ -376,34 +413,51 @@ def print_corpus_stats(corpus: Corpus) -> None:
     )
 
 
+LATENCY_PERCENTILES = (50, 75, 95, 99)
+
+
 def print_latency_table(title: str, series: list[tuple[str, np.ndarray]]) -> None:
+    """Latency distribution of every config, and its speedup over the baseline.
+
+    The speedup at pNN is the baseline's pNN divided by the config's pNN.
+    `paired x` is the median over queries of the baseline time divided by the
+    config time: every config saw the same query at about the same time.
+    """
     # percentile(x, q) is the value below which q% of the samples fall
-    base_p50 = np.percentile(series[0][1], 50)
+    base = np.percentile(series[0][1], LATENCY_PERCENTILES)
     header = (
-        f"{'config':<16}{'min ms':>9}{'p50 ms':>9}{'p95 ms':>9}{'max ms':>9}"
-        f"{'p50 x':>8}{'paired x':>10}"
+        f"{'config':<16}{'min ms':>9}"
+        + "".join(f"{f'p{q} ms':>9}" for q in LATENCY_PERCENTILES)
+        + f"{'max ms':>9}"
+        + "".join(f"{f'p{q} x':>8}" for q in LATENCY_PERCENTILES)
+        + f"{'paired x':>10}"
     )
     print(f"\n{title}\n")
     print(header)
     print("-" * len(header))
     for label, latencies in series:
-        p50, p95 = np.percentile(latencies, [50, 95])  # both in one pass
-        # every config saw the same query at about the same time, so compare per query
+        pcts = np.percentile(latencies, LATENCY_PERCENTILES)
         paired = np.median(series[0][1] / latencies)
         print(
-            f"{label:<16}{latencies.min():>9.2f}{p50:>9.2f}{p95:>9.2f}"
-            f"{latencies.max():>9.2f}{base_p50 / p50:>8.2f}{paired:>10.2f}"
+            f"{label:<16}{latencies.min():>9.2f}"
+            + "".join(f"{value:>9.2f}" for value in pcts)
+            + f"{latencies.max():>9.2f}"
+            + "".join(f"{speedup:>8.2f}" for speedup in base / pcts)
+            + f"{paired:>10.2f}"
         )
 
 
-def print_quality_table(results: list[RunResult]) -> None:
-    header = f"{'config':<16}{'recall':>9}{'mrr':>9}{'ndcg':>9}"
-    print(f"\nQuality at {TOP}, ground truth is the exact top {TOP}\n")
+def print_quality_table(name: str, series: list[tuple[str, np.ndarray]]) -> None:
+    """Distribution over queries of one quality metric, for every config."""
+    header = f"{'config':<16}{'mean':>9}{'min':>9}{'p50':>9}{'p95':>9}{'max':>9}"
+    print(f"\n{name} at {TOP} over queries, ground truth is the exact top {TOP}\n")
     print(header)
     print("-" * len(header))
-    for result in results:
+    for label, values in series:
+        p50, p95 = np.percentile(values, [50, 95])
         print(
-            f"{result.label:<16}{result.recall:>9.4f}{result.mrr:>9.4f}{result.ndcg:>9.4f}"
+            f"{label:<16}{values.mean():>9.4f}{values.min():>9.4f}"
+            f"{p50:>9.4f}{p95:>9.4f}{values.max():>9.4f}"
         )
 
 
@@ -416,7 +470,9 @@ def print_report(results: list[RunResult]) -> None:
         "Latency, client side (includes HTTP)",
         [(result.label, result.client_ms) for result in results],
     )
-    print_quality_table(results)
+    print_quality_table("Recall", [(r.label, r.recall) for r in results])
+    print_quality_table("MRR", [(r.label, r.mrr) for r in results])
+    print_quality_table("nDCG", [(r.label, r.ndcg) for r in results])
 
 
 async def run(
@@ -432,18 +488,20 @@ async def run(
             await upload(client, args.collection, corpus, args.batch_size)
             await wait_until_green(client, args.collection)
         info = await collection_info(client, args.collection)
-        print(
+        progress(
             f"Collection: {info['points_count']} points, {info['segments_count']} segments"
         )
 
         vectors = [
             row_to_json(corpus.queries, row) for row in range(corpus.queries.shape[0])
         ]
+        own_ids = [corpus.doc_ids[row] for row in corpus.query_rows]
         await assert_query_cut_supported(client, args.collection, vectors[0])
         results = await run_interleaved(
             client,
             args.collection,
             vectors,
+            own_ids,
             expected,
             configs(args.query_cut, args.oversampling),
             args.warmup,
@@ -463,8 +521,16 @@ def parse_args() -> argparse.Namespace:
         description="Compare sparse search with and without query_cut."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--max-docs", type=int, default=1_000_000)
-    parser.add_argument("--num-queries", type=int, default=1_000)
+    parser.add_argument("--max-docs", type=int, default=2_000_000)
+    parser.add_argument(
+        "--num-queries",
+        type=int,
+        default=1_000,
+        help="number of corpus docs sampled at random to be used as queries",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="seed of the sampling of the query docs"
+    )
     parser.add_argument("--url", default="http://localhost:6333")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--collection", default="query_cut_bench")
@@ -493,9 +559,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    corpus = load_corpus(args.data_dir, args.max_docs, args.num_queries)
+    corpus = load_corpus(args.data_dir, args.max_docs, args.num_queries, args.seed)
     print_corpus_stats(corpus)
-    print("Computing ground truth")
+    progress("Computing ground truth")
     expected = ground_truth(corpus)
     asyncio.run(run(args, corpus, expected))
 
